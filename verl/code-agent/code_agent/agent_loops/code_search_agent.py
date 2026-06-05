@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -158,6 +159,52 @@ class CodeSearchAgentLoop(AgentLoopBase):
     async def _run_search(self, query: str) -> str:
         return await asyncio.to_thread(run_search, query)
 
+    def _workspace_root(self) -> Path | None:
+        for key in ["CODE_AGENT_WORKSPACE_PATH", "CODE_AGENT_REPO_ROOT", "CODE_AGENT_REPO_DIR"]:
+            value = os.environ.get(key)
+            if value:
+                return Path(value).expanduser().resolve()
+        return None
+
+    def _open_file_sync(self, file_path: str) -> str:
+        root = self._workspace_root()
+        if root is None:
+            return "open_file unavailable: workspace path is not configured"
+        if not root.exists() or not root.is_dir():
+            return f"open_file unavailable: workspace path does not exist: {root}"
+
+        raw_path = Path(str(file_path).strip())
+        if not str(raw_path):
+            return "open_file unavailable: empty path"
+        target = raw_path if raw_path.is_absolute() else root / raw_path
+        try:
+            target = target.resolve()
+        except Exception as exc:
+            return f"open_file unavailable: cannot resolve path: {exc}"
+
+        try:
+            target.relative_to(root)
+        except ValueError:
+            return "open_file unavailable: path is outside configured workspace"
+        if not target.exists():
+            return f"open_file unavailable: file does not exist: {raw_path}"
+        if not target.is_file():
+            return f"open_file unavailable: path is not a file: {raw_path}"
+
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return f"open_file unavailable: failed to read file: {exc}"
+
+        rel_path = target.relative_to(root)
+        numbered = [f"{i:>6} | {line}" for i, line in enumerate(text.splitlines(), 1)]
+        if not numbered:
+            numbered = ["     1 | "]
+        return f"path: {rel_path}\n" + "\n".join(numbered)
+
+    async def _open_file(self, file_path: str) -> str:
+        return await asyncio.to_thread(self._open_file_sync, file_path)
+
     async def _generate_once(self, prompt_ids: list[int], sampling_params: dict[str, Any]) -> list[int]:
         output = await self.server_manager.generate(
             request_id=uuid4().hex,
@@ -181,22 +228,28 @@ class CodeSearchAgentLoop(AgentLoopBase):
         return (
             "\n\n<observation>"
             "Invalid action. Output exactly one action: "
-            "<think>reasoning</think><search>query</search>, "
-            "<think>reasoning</think><code>python code or unified diff</code>, "
-            "or <think>reasoning</think><answer>final Python code or unified diff patch</answer>. "
-            "<code> is only for intermediate sandbox execution; put the final solution in <answer>. "
-            "Do not put <code> or <search> inside <answer>. "
+            "<search_code>query</search_code>, "
+            "<open_file>path</open_file>, "
+            "<run_sandbox>command</run_sandbox>, "
+            "<generate_patch>unified diff patch</generate_patch>, "
+            "or <final>status</final>. "
+            "Put candidate patches in <generate_patch>. Use <final> only to finish or summarize status. "
             "Do not generate <information> or <observation> yourself."
             "</observation>\n\n"
         )
 
     async def _handle_action(self, action: ParsedAction) -> tuple[str | None, str]:
-        if action.action_type == "search":
+        if action.action_type == "search_code":
             information = await self._run_search(action.content)
             return "information", information
-        if action.action_type == "code":
+        if action.action_type == "open_file":
+            observation = await self._open_file(action.content)
+            return "observation", observation
+        if action.action_type == "run_sandbox":
             observation = await self._run_code(action.content)
             return "observation", observation
+        if action.action_type == "generate_patch":
+            return "observation", "patch received"
         return None, ""
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -217,6 +270,7 @@ class CodeSearchAgentLoop(AgentLoopBase):
         response_ids: list[int] = []
         response_mask: list[int] = []
         action_trace: list[dict[str, Any]] = []
+        candidate_patch = ""
 
         t_generate = 0.0
         t_tool = 0.0
@@ -242,11 +296,16 @@ class CodeSearchAgentLoop(AgentLoopBase):
 
             action_trace.append({"turn": num_turns, "action_type": action.action_type})
 
-            if action.action_type == "answer":
+            if action.action_type == "generate_patch":
+                candidate_patch = action.content
                 finished = True
                 break
 
-            if action.action_type in {"search", "code"}:
+            if action.action_type == "final":
+                finished = True
+                break
+
+            if action.action_type in {"search_code", "open_file", "run_sandbox"}:
                 t0 = time.time()
                 env_tag, env_content = await self._handle_action(action)
                 t_tool += time.time() - t0
@@ -270,6 +329,8 @@ class CodeSearchAgentLoop(AgentLoopBase):
             final_ids = self._encode(final_action.raw_text)
             self._append_tokens(response_ids, response_mask, cur_prompt_ids, final_ids, 1, max_response_length)
             action_trace.append({"turn": num_turns, "action_type": final_action.action_type, "final_rollout": True})
+            if final_action.action_type == "generate_patch":
+                candidate_patch = final_action.content
 
         response_ids, response_mask = self._truncate_response(response_ids, response_mask, max_response_length)
 
@@ -282,6 +343,7 @@ class CodeSearchAgentLoop(AgentLoopBase):
             metrics=AgentLoopMetrics(generate_sequences=t_generate, tool_calls=t_tool),
             extra_fields={
                 "action_trace": action_trace,
+                "candidate_patch": candidate_patch,
                 "turn_scores": [],
                 "tool_rewards": [],
             },

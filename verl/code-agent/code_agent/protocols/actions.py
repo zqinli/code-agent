@@ -14,6 +14,10 @@ class ParsedAction:
     think: str = ""
 
 
+ACTION_TAGS = ("search_code", "open_file", "run_sandbox", "generate_patch", "final")
+ACTION_TAG_RE = "|".join(ACTION_TAGS)
+
+
 def _strip(text: str | None) -> str:
     return "" if text is None else str(text).strip()
 
@@ -24,7 +28,8 @@ def parse_action(text: str | None) -> ParsedAction:
 
     think_action = re.compile(
         r"(?P<raw>\s*<think>(?P<think>.*?)</think>\s*"
-        r"<(?P<tag>search|code|answer)>(?P<content>.*?)</(?P=tag)>)",
+        rf"<(?P<tag>{ACTION_TAG_RE})>(?P<content>.*?)</(?P=tag)>"
+        r"(?:\s*<final>.*?</final>)?)",
         flags=re.DOTALL,
     )
     match = think_action.search(text)
@@ -37,7 +42,8 @@ def parse_action(text: str | None) -> ParsedAction:
         )
 
     direct_action = re.compile(
-        r"(?P<raw>\s*<(?P<tag>search|code|answer)>(?P<content>.*?)</(?P=tag)>)",
+        rf"(?P<raw>\s*<(?P<tag>{ACTION_TAG_RE})>(?P<content>.*?)</(?P=tag)>"
+        r"(?:\s*<final>.*?</final>)?)",
         flags=re.DOTALL,
     )
     match = direct_action.search(text)
@@ -55,33 +61,35 @@ def parse_action(text: str | None) -> ParsedAction:
 
 
 def parse_final_action(text: str | None) -> ParsedAction:
-    """Prefer final answer, then fall back to normal action parsing."""
+    """Prefer patch/final actions, then fall back to normal action parsing."""
     text = "" if text is None else str(text)
 
-    think_answer = re.compile(
-        r"(?P<raw>\s*<think>(?P<think>.*?)</think>\s*<answer>(?P<content>.*?)</answer>)",
+    think_terminal = re.compile(
+        r"(?P<raw>\s*<think>(?P<think>.*?)</think>\s*"
+        r"<(?P<tag>generate_patch|final)>(?P<content>.*?)</(?P=tag)>"
+        r"(?:\s*<final>.*?</final>)?)",
         flags=re.DOTALL,
     )
-    match = think_answer.search(text)
+    match = think_terminal.search(text)
     if match:
         return ParsedAction(
-            action_type="answer",
+            action_type=match.group("tag").strip(),
             content=match.group("content").strip(),
             raw_text=match.group("raw").strip(),
             think=match.group("think").strip(),
         )
 
-    direct_answer = re.compile(
-        r"(?P<raw>\s*<answer>(?P<content>.*?)</answer>)",
+    direct_terminal = re.compile(
+        r"(?P<raw>\s*<(?P<tag>generate_patch|final)>(?P<content>.*?)</(?P=tag)>"
+        r"(?:\s*<final>.*?</final>)?)",
         flags=re.DOTALL,
     )
-    match = direct_answer.search(text)
+    match = direct_terminal.search(text)
     if match:
         return ParsedAction(
-            action_type="answer",
+            action_type=match.group("tag").strip(),
             content=match.group("content").strip(),
             raw_text=match.group("raw").strip(),
         )
 
     return parse_action(text)
-

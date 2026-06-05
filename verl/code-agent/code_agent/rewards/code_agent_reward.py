@@ -24,7 +24,9 @@ from typing import Any
 DEFAULT_TIMEOUT = 10
 
 
-TAG_RE = re.compile(r"<(?P<tag>think|search|code|answer)>(?P<body>.*?)</(?P=tag)>", re.DOTALL)
+ACTION_TAGS = ("search_code", "open_file", "run_sandbox", "generate_patch", "final")
+KNOWN_TAGS = ("think", *ACTION_TAGS)
+TAG_RE = re.compile(r"<(?P<tag>think|search_code|open_file|run_sandbox|generate_patch|final)>(?P<body>.*?)</(?P=tag)>", re.DOTALL)
 
 
 def _json_loads_maybe(value: Any, default: Any = None) -> Any:
@@ -56,7 +58,7 @@ def _as_list(value: Any) -> list[Any]:
 
 
 def _parse_tags(text: str) -> dict[str, list[str]]:
-    tags: dict[str, list[str]] = {"think": [], "search": [], "code": [], "answer": []}
+    tags: dict[str, list[str]] = {tag: [] for tag in KNOWN_TAGS}
     for match in TAG_RE.finditer(text or ""):
         tags[match.group("tag")].append(match.group("body").strip())
     return tags
@@ -70,46 +72,60 @@ def _strip_markdown_fence(text: str) -> str:
     return text
 
 
-def _extract_executable(solution: str) -> tuple[str, str]:
-    """Return (content, source_tag), preferring the final <answer>.
+def _extract_diff_from_text(text: str) -> str:
+    text = _strip_markdown_fence(text)
+    if not text:
+        return ""
+    match = re.search(r"^diff --git\s+", text, flags=re.MULTILINE)
+    if match:
+        return text[match.start() :].strip()
+    match = re.search(r"^---\s+", text, flags=re.MULTILINE)
+    if match and re.search(r"^\+\+\+\s+", text[match.start() :], flags=re.MULTILINE):
+        return text[match.start() :].strip()
+    return ""
 
-    In the agent protocol, <code> is an intermediate sandbox action. The final
-    solution submitted for reward should live inside <answer>. We only fall
-    back to <code> for malformed/legacy trajectories that never produce an
-    answer.
-    """
+
+def _extract_executable(solution: str) -> tuple[str, str]:
+    """Return final patch/code content and the protocol source tag."""
     tags = _parse_tags(solution)
-    if tags["answer"]:
-        return _strip_markdown_fence(tags["answer"][-1]), "answer"
-    if tags["code"]:
-        return _strip_markdown_fence(tags["code"][-1]), "code"
+    if tags["generate_patch"]:
+        return _strip_markdown_fence(tags["generate_patch"][-1]), "generate_patch"
+    if tags["final"]:
+        final_text = _strip_markdown_fence(tags["final"][-1])
+        final_diff = _extract_diff_from_text(final_text)
+        return (final_diff or final_text), "final"
+    raw_diff = _extract_diff_from_text(solution)
+    if raw_diff:
+        return raw_diff, "raw_diff"
     return _strip_markdown_fence(solution), "raw"
 
 
 def _format_score(solution: str, gt: dict[str, Any]) -> tuple[float, dict[str, Any]]:
     tags = _parse_tags(solution)
-    required = gt.get("required_tags") or ["think", "answer"]
-    optional = set(gt.get("optional_tags") or ["search", "code"])
+    required = gt.get("required_tags") or []
+    optional = set(gt.get("optional_tags") or ACTION_TAGS)
     allowed_tags = set(required) | optional
+    allowed_tags.update({"think"})
 
     required_hits = sum(1 for tag in required if tags.get(tag))
-    required_score = required_hits / max(1, len(required))
+    _, source_tag = _extract_executable(solution)
+    terminal_score = 1.0 if source_tag in {"generate_patch", "final", "raw_diff"} else 0.0
+    required_score = required_hits / max(1, len(required)) if required else terminal_score
 
     env_tag_penalty = 0.0
     if re.search(r"</?(information|observation)>", solution or "", flags=re.IGNORECASE):
         env_tag_penalty = 0.25
 
     malformed_penalty = 0.0
-    for tag in ["think", "search", "code", "answer"]:
+    for tag in KNOWN_TAGS:
         opens = len(re.findall(fr"<{tag}>", solution or ""))
         closes = len(re.findall(fr"</{tag}>", solution or ""))
         if opens != closes:
             malformed_penalty += 0.15
 
-    _, source_tag = _extract_executable(solution)
     needs_code = bool((gt.get("expected_behavior") or {}).get("needs_code", True))
     code_score = 1.0
-    if needs_code and source_tag not in {"code", "answer"}:
+    if needs_code and source_tag not in {"generate_patch", "final", "raw_diff"}:
         code_score = 0.0
 
     extra_tags = [
@@ -122,9 +138,11 @@ def _format_score(solution: str, gt: dict[str, Any]) -> tuple[float, dict[str, A
     score = max(0.0, 0.7 * required_score + 0.3 * code_score - env_tag_penalty - malformed_penalty - unknown_penalty)
     return score, {
         "has_think": bool(tags["think"]),
-        "has_answer": bool(tags["answer"]),
-        "has_code": bool(tags["code"]),
-        "has_search": bool(tags["search"]),
+        "has_search_code": bool(tags["search_code"]),
+        "has_open_file": bool(tags["open_file"]),
+        "has_run_sandbox": bool(tags["run_sandbox"]),
+        "has_generate_patch": bool(tags["generate_patch"]),
+        "has_final": bool(tags["final"]),
         "executable_source": source_tag,
         "format_penalty": env_tag_penalty + malformed_penalty + unknown_penalty,
     }
@@ -238,6 +256,8 @@ def _run_stdin_tests(code: str, cases: list[dict[str, Any]], timeout: int = DEFA
 
 
 def _looks_like_unified_diff(patch: str) -> bool:
+    if re.search(r"^diff --git\s+", patch or "", re.MULTILINE):
+        return True
     return bool(re.search(r"^---\s+", patch or "", re.MULTILINE)) and bool(
         re.search(r"^\+\+\+\s+", patch or "", re.MULTILINE)
     ) and bool(re.search(r"^@@\s+", patch or "", re.MULTILINE))
@@ -276,6 +296,55 @@ def _evaluate_patch(patch: str, tests: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _modified_files_from_patch(patch: str) -> list[str]:
+    files: list[str] = []
+    for match in re.finditer(r"^diff --git a/(.*?) b/(.*?)$", patch or "", flags=re.MULTILINE):
+        files.append(match.group(2).strip())
+    for match in re.finditer(r"^\+\+\+\s+(?:b/)?(.+?)$", patch or "", flags=re.MULTILINE):
+        path = match.group(1).strip()
+        if path != "/dev/null":
+            files.append(path)
+    return list(dict.fromkeys(files))
+
+
+def _does_not_modify_tests(patch: str, gt: dict[str, Any]) -> float:
+    if not gt.get("forbidden_modify_tests", False):
+        return 1.0
+    for path in _modified_files_from_patch(patch):
+        lowered = path.lower()
+        parts = lowered.split("/")
+        if "tests" in parts or "test" in parts or lowered.startswith("test_") or "/test_" in lowered:
+            return 0.0
+    return 1.0
+
+
+def _search_or_open_hits_gold_file(solution: str, gt: dict[str, Any]) -> float:
+    gold_files = [str(x) for x in _as_list(gt.get("gold_files")) if x]
+    if not gold_files:
+        return 0.0
+    tags = _parse_tags(solution)
+    action_text = "\n".join(tags["search_code"] + tags["open_file"]).lower()
+    if not action_text.strip():
+        return 0.0
+    for path in gold_files:
+        lowered = path.lower()
+        basename = lowered.rsplit("/", 1)[-1]
+        if lowered in action_text or basename in action_text:
+            return 1.0
+    return 0.0
+
+
+def _reward_weights(parts: dict[str, float], reward_spec: Any, reward_items: Any) -> dict[str, float]:
+    if isinstance(reward_spec, dict):
+        return reward_spec
+    items = reward_spec if isinstance(reward_spec, list) else reward_items
+    items = [str(item) for item in _as_list(items) if str(item) in parts]
+    if not items:
+        return {}
+    weight = 1.0 / len(items)
+    return {item: weight for item in items}
+
+
 def _weighted_sum(parts: dict[str, float], weights: dict[str, Any]) -> float:
     if not weights:
         return sum(parts.values()) / max(1, len(parts))
@@ -295,6 +364,21 @@ def _load_ground_truth(ground_truth: Any, extra_info: dict[str, Any] | None) -> 
     extra_info = extra_info or {}
     if not isinstance(gt, dict):
         gt = {}
+    reward_meta = _json_loads_maybe(extra_info.get("reward_meta"), {})
+    if isinstance(reward_meta, dict):
+        for key in ["gold_patch", "gold_files", "weak_reward_items", "reward_items", "forbidden_modify_tests"]:
+            if key in reward_meta and key not in gt:
+                gt[key] = reward_meta[key]
+    if "reward_items" not in gt and "weak_reward_items" in gt:
+        gt["reward_items"] = gt["weak_reward_items"]
+    reference_patch = gt.get("reference_patch") or gt.get("gold_patch")
+    if reference_patch:
+        tests = gt.setdefault("tests", {})
+        if isinstance(tests, dict) and not tests.get("reference_patch"):
+            tests["reference_patch"] = reference_patch
+        execution = gt.setdefault("execution", {})
+        if isinstance(execution, dict) and not execution.get("type"):
+            execution["type"] = "patch"
     for key, extra_key in [
         ("execution", "execution_json"),
         ("tests", "tests_json"),
@@ -323,6 +407,7 @@ def compute_score(
     execution = gt.get("execution") or {}
     tests = gt.get("tests") or {}
     reward_spec = gt.get("reward_spec") or {}
+    reward_items = gt.get("reward_items") or gt.get("weak_reward_items") or []
     execution_type = execution.get("type")
     timeout = int(execution.get("timeout_sec") or os.environ.get("CODE_AGENT_REWARD_TIMEOUT", DEFAULT_TIMEOUT))
 
@@ -379,29 +464,39 @@ def compute_score(
             patch_scores = _evaluate_patch(executable, tests)
 
     answer_quality = 1.0 if has_executable else 0.0
-    code_extractable = 1.0 if executable_source in {"code", "answer"} and has_executable else 0.0
+    code_extractable = 1.0 if executable_source in {"generate_patch", "final", "raw_diff"} and has_executable else 0.0
 
     if execution_type == "patch":
         parts = {
             "format": fmt_score,
+            "valid_action_format": fmt_score,
             "code_extractable": code_extractable,
             "patch_apply": patch_scores.get("patch_apply", 0.0),
+            "patch_can_apply": patch_scores.get("patch_apply", 0.0),
             "syntax_or_static_check": patch_scores.get("syntax_or_static_check", 0.0),
+            "changed_python_files_compile": patch_scores.get("syntax_or_static_check", 0.0),
             "diff_similarity": patch_scores.get("diff_similarity", 0.0),
+            "patch_similarity_to_gold": patch_scores.get("diff_similarity", 0.0),
             "intent_match": patch_scores.get("intent_match", 0.0),
+            "search_or_open_hits_gold_file": _search_or_open_hits_gold_file(solution_str, gt),
+            "does_not_modify_tests": _does_not_modify_tests(executable, gt),
             "answer_quality": answer_quality,
         }
     else:
         parts = {
             "format": fmt_score,
+            "valid_action_format": fmt_score,
             "code_extractable": code_extractable,
             "compile": compile_score,
             "public_tests": public_score,
             "hidden_tests": hidden_score if hidden_total else public_score,
+            "used_search_code": 1.0 if fmt_info["has_search_code"] else 0.0,
+            "used_open_file": 1.0 if fmt_info["has_open_file"] else 0.0,
+            "used_run_sandbox": 1.0 if fmt_info["has_run_sandbox"] else 0.0,
             "answer_quality": answer_quality,
         }
 
-    score = _weighted_sum(parts, reward_spec)
+    score = _weighted_sum(parts, _reward_weights(parts, reward_spec, reward_items))
     pass_rate = public_score if public_total else 0.0
 
     return {
