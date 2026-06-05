@@ -1,0 +1,131 @@
+# Tokenizer instance passed by the trainer after model initialization.
+tokenizer: null
+
+# Processor instance passed by the trainer for multimodal datasets.
+processor: null
+
+# Whether dataset files are staged through shared memory.
+use_shm: false
+
+# Training parquet/json/jsonl files.
+train_files: null
+
+# Validation parquet/json/jsonl files.
+val_files: null
+
+# Maximum number of training samples to keep; -1 keeps all samples.
+train_max_samples: -1
+
+# Maximum number of validation samples to keep; -1 keeps all samples.
+val_max_samples: -1
+
+# Dataset column containing the prompt or chat messages.
+prompt_key: prompt
+
+# Dataset column containing supervised responses when present.
+response_key: responses
+
+# Dataset column containing reward model metadata.
+reward_model_key: reward_model
+
+# Dataset column containing extra sample metadata.
+extra_info_key: extra_info
+
+# Dataset column containing reward function routing source.
+data_source_key: data_source
+
+# Dataset column containing task ability labels.
+ability_key: ability
+
+# Dataset column used by the legacy reward function selector.
+reward_fn_key: data_source
+
+# Maximum prompt length in tokens.
+max_prompt_length: 512
+
+# Maximum generated response length in tokens.
+max_response_length: 512
+
+# Training batch size before rollout expansion.
+train_batch_size: 1024
+
+# Validation batch size; null falls back to validation defaults in trainer code.
+val_batch_size: null
+
+# Optional multi-turn tool config path inherited from rollout config.
+tool_config_path: ${oc.select:actor_rollout_ref.rollout.multi_turn.tool_config_path,null}
+
+# Optional function tool path inherited from rollout config.
+function_tool_path: ${oc.select:actor_rollout_ref.rollout.multi_turn.function_tool_path,null}
+
+# Whether to return raw token ids from dataset items.
+return_raw_input_ids: false
+
+# Whether to return raw chat messages from dataset items.
+return_raw_chat: false
+
+# Whether to return the full formatted prompt string.
+return_full_prompt: false
+
+# Whether to return multimodal processor inputs.
+return_multi_modal_inputs: true
+
+# Whether to shuffle the training dataset.
+shuffle: true
+
+# Random seed used by the training sampler.
+seed: 1
+
+# Number of workers used by torch dataloaders.
+dataloader_num_workers: 8
+
+# Whether to shuffle validation data.
+validation_shuffle: false
+
+# Whether to filter prompts longer than max_prompt_length.
+filter_overlong_prompts: false
+
+# Number of workers used for overlong prompt filtering.
+filter_overlong_prompts_workers: 1
+
+# Prompt truncation behavior.
+truncation: error
+
+# Dataset column containing images.
+image_key: images
+
+# Dataset column containing videos.
+video_key: videos
+
+# Image patch size used when estimating multimodal token lengths.
+image_patch_size: 14
+
+# Whether dataset/model helpers may trust remote code.
+trust_remote_code: false
+
+# Optional custom dataset class.
+custom_cls:
+
+  # Python file path for the custom dataset class.
+  path: null
+
+  # Custom dataset class name.
+  name: null
+
+# Compatibility switch for scripts that override chat-template behavior.
+apply_chat_template: true
+
+# Extra keyword arguments passed to tokenizer.apply_chat_template.
+apply_chat_template_kwargs: {}
+
+# Optional chat template function path/name handled by custom datasets.
+chat_template_func: null
+
+# Cache directory used by RL dataset helpers.
+cache_dir: ~/.cache/verl/rlhf
+
+# Whether dataset examples should include tool kwargs.
+need_tools_kwargs: false
+
+# Whether the dataset should filter prompts during construction.
+filter_prompts: true
