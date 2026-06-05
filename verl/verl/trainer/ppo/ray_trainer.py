@@ -559,12 +559,14 @@ class RayPPOTrainer:
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
                 # to spare GPU memory for reward model
-                self.checkpoint_manager.sleep_replicas()
+                if not self.use_hf_agent_rollout:
+                    self.checkpoint_manager.sleep_replicas()
                 batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
                 test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
                 # wake up rollout model
                 # replace with wake_up method once supported
-                self.checkpoint_manager.update_weights(self.global_steps)
+                if not self.use_hf_agent_rollout:
+                    self.checkpoint_manager.update_weights(self.global_steps)
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -825,6 +827,7 @@ class RayPPOTrainer:
         # create async rollout manager and request scheduler
         # Note: mode is always "async" since sync mode is deprecated
         self.async_rollout_mode = True
+        self.use_hf_agent_rollout = self.config.actor_rollout_ref.rollout.name == "hf_agent"
 
         # initialize teacher loop manager
         if self.use_teacher_policy:
@@ -852,37 +855,49 @@ class RayPPOTrainer:
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
         enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
 
-        self.llm_server_manager = LLMServerManager.create(
-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
-        )
-
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
         # To stream teacher computation with actor rollout, we instead pass the full manager so that the
         # teacher loop workers can sleep/wake together with rollout workers
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
-        self.async_rollout_manager = AgentLoopManager.create(
-            config=self.config,
-            llm_client=self.llm_server_manager.get_client(),
-            teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
-            reward_loop_worker_handles=reward_loop_worker_handles,
-        )
+        if self.use_hf_agent_rollout:
+            from verl.experimental.agent_loop.hf_agent_loop_manager import HFAgentLoopManager
 
-        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        # Support custom CheckpointEngineManager via config
-        checkpoint_manager_class_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
-        if checkpoint_manager_class_fqn:
-            CheckpointEngineManager = load_class_from_fqn(checkpoint_manager_class_fqn, "CheckpointEngineManager")
+            self.llm_server_manager = None
+            self.async_rollout_manager = HFAgentLoopManager.create(
+                config=self.config,
+                actor_rollout_wg=self.actor_rollout_wg,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                reward_loop_worker_handles=reward_loop_worker_handles,
+            )
+            self.checkpoint_manager = None
         else:
-            from verl.checkpoint_engine import CheckpointEngineManager
-        self.checkpoint_manager = CheckpointEngineManager(
-            config=checkpoint_engine_config,
-            trainer=self.actor_rollout_wg,
-            replicas=self.llm_server_manager.get_replicas(),
-        )
+            self.llm_server_manager = LLMServerManager.create(
+                config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
+            )
+            self.async_rollout_manager = AgentLoopManager.create(
+                config=self.config,
+                llm_client=self.llm_server_manager.get_client(),
+                teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
+                reward_loop_worker_handles=reward_loop_worker_handles,
+            )
 
-        # sleep all replicas to load checkpoint
-        self.checkpoint_manager.sleep_replicas()
+            checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+            # Support custom CheckpointEngineManager via config
+            checkpoint_manager_class_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
+            if checkpoint_manager_class_fqn:
+                CheckpointEngineManager = load_class_from_fqn(checkpoint_manager_class_fqn, "CheckpointEngineManager")
+            else:
+                from verl.checkpoint_engine import CheckpointEngineManager
+            self.checkpoint_manager = CheckpointEngineManager(
+                config=checkpoint_engine_config,
+                trainer=self.actor_rollout_wg,
+                replicas=self.llm_server_manager.get_replicas(),
+            )
+
+            # sleep all replicas to load checkpoint
+            self.checkpoint_manager.sleep_replicas()
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1294,7 +1309,8 @@ class RayPPOTrainer:
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
-        self.checkpoint_manager.update_weights(self.global_steps)
+        if not self.use_hf_agent_rollout:
+            self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -1361,11 +1377,12 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if curr_step_profile:
+                        if curr_step_profile and not self.use_hf_agent_rollout:
                             self.llm_server_manager.start_profile()
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                        self.checkpoint_manager.sleep_replicas()
-                        if curr_step_profile:
+                        if not self.use_hf_agent_rollout:
+                            self.checkpoint_manager.sleep_replicas()
+                        if curr_step_profile and not self.use_hf_agent_rollout:
                             self.llm_server_manager.stop_profile()
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
@@ -1375,11 +1392,12 @@ class RayPPOTrainer:
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
-                            if curr_step_profile:
+                            if curr_step_profile and not self.use_hf_agent_rollout:
                                 self.llm_server_manager.start_profile()
                             gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                            self.checkpoint_manager.sleep_replicas()
-                            if curr_step_profile:
+                            if not self.use_hf_agent_rollout:
+                                self.checkpoint_manager.sleep_replicas()
+                            if curr_step_profile and not self.use_hf_agent_rollout:
                                 self.llm_server_manager.stop_profile()
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch
@@ -1548,7 +1566,8 @@ class RayPPOTrainer:
                     # implement critic warmup
                     if self.config.trainer.critic_warmup > self.global_steps:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
-                        self.checkpoint_manager.update_weights(self.global_steps)
+                        if not self.use_hf_agent_rollout:
+                            self.checkpoint_manager.update_weights(self.global_steps)
                     else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
@@ -1578,7 +1597,8 @@ class RayPPOTrainer:
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
-                            self.checkpoint_manager.update_weights(self.global_steps)
+                            if not self.use_hf_agent_rollout:
+                                self.checkpoint_manager.update_weights(self.global_steps)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

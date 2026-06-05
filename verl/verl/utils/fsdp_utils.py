@@ -618,7 +618,7 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
             if name.endswith(".model") or name.endswith(".layers"):
                 continue
             if fsdp_version(submodule) > 0:
-                with FSDP.summon_full_params(submodule, writeback=False):
+                with FSDP.summon_full_params(submodule, writeback=False, offload_to_cpu=True):
                     sub_lora_params = get_peft_model_state_dict(peft_model, state_dict=submodule.state_dict())
                     sub_lora_params = {
                         f"{prefix}.{name}": param.full_tensor().detach().cpu()
@@ -650,7 +650,7 @@ def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool
                 )
             lora_params = layered_summon_lora_params(module)
         else:
-            with FSDP.summon_full_params(module, writeback=False):
+            with FSDP.summon_full_params(module, writeback=False, offload_to_cpu=True):
                 if base_sync_done:
                     lora_params = get_peft_model_state_dict(peft_model)
                     lora_params = {

@@ -583,7 +583,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
         # 3. build rollout engine
-        if "rollout" in self.role:
+        if "rollout" in self.role and self.config.rollout.name != "hf_agent":
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
 
             # TODO: move rollout_device_mesh into ServerAdapter
@@ -609,6 +609,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
             self.layered_summon = self.config.rollout.get("layered_summon", False)
             self.peft_merge: bool = model_config.lora.get("merge", False)
+        elif "rollout" in self.role:
+            self.rollout = None
+            self.base_sync_done = True
+            self.layered_summon = False
+            self.peft_merge = model_config.lora.get("merge", False)
 
         # 4. build checkpoint engine
         if "actor" in self.role:
@@ -657,6 +662,75 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @torch.no_grad()
+    def hf_generate(self, prompt_ids: list[int], sampling_params: dict | None = None):
+        """Generate one response directly from the actor HF policy.
+
+        This is used by the hf_agent rollout path. It deliberately uses the
+        actor model in-place and does not synchronize weights to a rollout
+        server.
+        """
+        assert "actor" in self.role, "hf_generate only supports actor role"
+
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from transformers import GenerationConfig
+
+        sampling_params = dict(sampling_params or {})
+        module = self.actor.engine.module
+        was_training = module.training
+        model_was_offloaded = self.actor.engine.is_param_offload_enabled
+        if model_was_offloaded:
+            self.actor.engine.to(get_device_name(), model=True, optimizer=False, grad=False)
+
+        module.eval()
+        device = next(module.parameters()).device
+        input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
+        position_ids = attention_mask.cumsum(dim=-1) - 1
+
+        response_length = int(sampling_params.get("max_new_tokens") or sampling_params.get("max_tokens") or 512)
+        top_k = sampling_params.get("top_k", self.config.rollout.get("top_k", 0))
+        top_k = max(0, int(top_k)) if top_k is not None else 0
+        temperature = float(sampling_params.get("temperature", self.config.rollout.temperature))
+        do_sample = bool(sampling_params.get("do_sample", self.config.rollout.get("do_sample", True)))
+
+        generation_config = GenerationConfig(
+            do_sample=do_sample,
+            num_beams=1,
+            top_p=float(sampling_params.get("top_p", self.config.rollout.get("top_p", 1.0))),
+            top_k=top_k,
+            temperature=temperature,
+        )
+        eos_token_id = sampling_params.get("eos_token_id")
+        pad_token_id = sampling_params.get("pad_token_id")
+
+        param_ctx = nullcontext()
+        if isinstance(module, FSDP):
+            param_ctx = FSDP.summon_full_params(module, writeback=False, recurse=False)
+
+        with param_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+            output = module.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                max_new_tokens=response_length,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
+                generation_config=generation_config,
+                output_scores=False,
+                return_dict_in_generate=True,
+                use_cache=True,
+            )
+
+        token_ids = output.sequences[0, input_ids.size(1) :].detach().cpu().tolist()
+        if was_training:
+            module.train()
+        if model_was_offloaded:
+            self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+        aggressive_empty_cache(force_sync=True)
+        return {"token_ids": [int(token_id) for token_id in token_ids], "stop_reason": "completed"}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
