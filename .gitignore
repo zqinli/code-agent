@@ -1,0 +1,28 @@
+# large data / models / outputs
+data/
+datasets/
+models/
+outputs/
+checkpoints/
+wandb/
+runs/
+tmp/
+tmp_worktrees/
+*.tar.gz
+*.zip
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# logs
+*.log
+logs/
+
+# system
+.DS_Store
