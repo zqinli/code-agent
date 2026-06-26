@@ -12,7 +12,7 @@ This repository contains a SWE-Gym based code-agent training workspace built on 
 
 ## Data Pipeline
 
-The main data source is `SWE-Gym/SWE-Gym`. The preprocessing pipeline normalizes each issue instance, checks out the target repository at `base_commit`, retrieves relevant code context, and builds SFT and weak-GRPO datasets.
+The data pipeline is designed for SWE-Gym-style code-editing tasks. It normalizes each issue instance, checks out the target repository at `base_commit`, retrieves relevant code context, and builds SFT and weak-GRPO datasets.
 
 Main entry points:
 
@@ -22,11 +22,13 @@ scripts/filter_sft_8192.py
 scripts/prepare_verl_grpo_weak_data.py
 ```
 
-Current local dataset summary:
+Generated datasets are not included in this repository. Keep local JSONL/parquet files, cloned repositories, checkpoints, inference outputs, and other data artifacts under ignored local directories.
 
-- Raw valid SWE-Gym instances: `2438`
-- SFT 8192-token filtered data: `2721` total, `2585` train, `136` validation
-- Weak GRPO data: `2438` total, `2317` train, `121` validation
+## Data Privacy
+
+- This repository tracks code, scripts, and configuration templates only.
+- Do not commit generated datasets, cloned benchmark repositories, model checkpoints, inference outputs, or local evaluation artifacts.
+- Local credentials belong in ignored `.env` files. Use committed `.env.example` files only for placeholder keys.
 
 ## Training Pipeline
 

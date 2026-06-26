@@ -1,6 +1,7 @@
 # large data / models / outputs
 data/
 datasets/
+dataset/data/
 models/
 outputs/
 checkpoints/
@@ -10,6 +11,8 @@ tmp/
 tmp_worktrees/
 *.tar.gz
 *.zip
+*.jsonl
+*.parquet
 *.pt
 *.pth
 *.bin
