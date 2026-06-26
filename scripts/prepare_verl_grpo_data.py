@@ -41,13 +41,13 @@ def main():
 
             gold_patch = reward_meta.get("gold_patch", "")
             gold_files = reward_meta.get("gold_files", [])
-            weak_reward_items = reward_meta.get("weak_reward_items", [])
+            reward_items = reward_meta.get("reward_items", [])
 
             ground_truth = {
                 "reference_patch": gold_patch,
                 "gold_patch": gold_patch,
                 "gold_files": gold_files,
-                "reward_items": weak_reward_items,
+                "reward_items": reward_items,
                 "execution": {
                     "type": "patch"
                 },
@@ -66,7 +66,7 @@ def main():
             }
 
             row = {
-                "data_source": "swegym_code_agent_weak_grpo",
+                "data_source": "swegym_code_agent_grpo",
                 "prompt": messages,
                 "ability": "code_agent",
                 "reward_model": {
@@ -81,7 +81,7 @@ def main():
                     "reward_meta": reward_meta,
                     "gold_patch": gold_patch,
                     "gold_files": gold_files,
-                    "weak_reward_items": weak_reward_items,
+                    "reward_items": reward_items,
                 },
             }
 
@@ -115,7 +115,7 @@ def main():
             Counter(
                 item
                 for x in rows
-                for item in x["extra_info"].get("weak_reward_items", [])
+                for item in x["extra_info"].get("reward_items", [])
             )
         ),
         "train_path": str(train_path),

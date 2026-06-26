@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-cd /home/zhenqinli/rl-workplace
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 export CUDA_VISIBLE_DEVICES=0,1
 unset LD_LIBRARY_PATH
 
-export PYTHONPATH=/home/zhenqinli/rl-workplace/verl:/home/zhenqinli/rl-workplace/verl/code-agent:${PYTHONPATH:-}
+export PYTHONPATH="${PROJECT_ROOT}/verl:${PROJECT_ROOT}/verl/code-agent:${PYTHONPATH:-}"
 
 export HYDRA_FULL_ERROR=1
 export TOKENIZERS_PARALLELISM=false
@@ -22,24 +24,26 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CODE_AGENT_DISABLE_DENSE_RAG=1
 export CODE_AGENT_BGE_DEVICE=cpu
 export CODE_AGENT_BGE_USE_FP16=0
-export CODE_AGENT_RAG_CORPUS=/home/zhenqinli/rl-workplace/dataset/data/swegym_full_project/processed/retrieval_bm25_topk.jsonl
-export CODE_AGENT_RAG_INDEX_DIR=/home/zhenqinli/rl-workplace/dataset/data/swegym_full_project/processed/rag_index
+DATA_ROOT="${DATA_ROOT:-${PROJECT_ROOT}/dataset/data/swegym_full_project}"
+export CODE_AGENT_RAG_CORPUS="${CODE_AGENT_RAG_CORPUS:-${DATA_ROOT}/processed/retrieval_bm25_topk.jsonl}"
+export CODE_AGENT_RAG_INDEX_DIR="${CODE_AGENT_RAG_INDEX_DIR:-${DATA_ROOT}/processed/rag_index}"
 export CODE_AGENT_RAG_MAX_CONTEXT_DOCS=20000
 export CODE_AGENT_USE_ACTION_STOPS=1
 export CODE_AGENT_MAX_OBS_LENGTH=192
 export CODE_AGENT_ACTION_MAX_NEW_TOKENS=96
 export CODE_AGENT_FINAL_MAX_NEW_TOKENS=256
 
-# repo 根目录。open_file 如果只支持固定 workspace，后续可能还要改成按 extra_info.repo 动态解析。
-export CODE_AGENT_WORKSPACE_PATH=/home/zhenqinli/rl-workplace/dataset/data/swegym_full_project/repos
+# Repository checkout root used by tool actions such as <open_file> and <run_sandbox>.
+export CODE_AGENT_WORKSPACE_PATH="${CODE_AGENT_WORKSPACE_PATH:-${DATA_ROOT}/repos}"
 
-MODEL=/home/zhenqinli/rl-workplace/models/Qwen2.5-Coder-3B-Instruct-sdpa
-SFT_ADAPTER=/home/zhenqinli/rl-workplace/outputs/qwen25_coder_3b_swegym_sft_lora_exported/global_step_1292/lora_adapter
+MODEL="${MODEL:-${PROJECT_ROOT}/models/Qwen2.5-Coder-3B-Instruct-sdpa}"
+SFT_ADAPTER="${SFT_ADAPTER:-${PROJECT_ROOT}/outputs/qwen25_coder_3b_swegym_sft_lora_exported/global_step_1292/lora_adapter}"
 
-TRAIN=/home/zhenqinli/rl-workplace/dataset/data/swegym_full_project/verl_grpo_weak/train.parquet
-VAL=/home/zhenqinli/rl-workplace/dataset/data/swegym_full_project/verl_grpo_weak/val.parquet
+GRPO_DATA_DIR="${GRPO_DATA_DIR:-${DATA_ROOT}/verl_grpo}"
+TRAIN="${TRAIN:-${GRPO_DATA_DIR}/train.parquet}"
+VAL="${VAL:-${GRPO_DATA_DIR}/val.parquet}"
 
-OUT=/home/zhenqinli/rl-workplace/outputs/qwen25_coder_3b_swegym_code_agent_grpo_lora
+OUT="${OUT:-${PROJECT_ROOT}/outputs/qwen25_coder_3b_swegym_code_agent_grpo_lora}"
 
 python -m verl.trainer.main_ppo \
   algorithm.adv_estimator=grpo \
@@ -80,9 +84,9 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.enable_prefix_caching=False \
   actor_rollout_ref.rollout.n=4 \
   actor_rollout_ref.rollout.agent.default_agent_loop=code_search_agent \
-  actor_rollout_ref.rollout.agent.agent_loop_config_path=/home/zhenqinli/rl-workplace/verl/code-agent/configs/agent_loop_config.yaml \
+  actor_rollout_ref.rollout.agent.agent_loop_config_path="${PROJECT_ROOT}/verl/code-agent/configs/agent_loop_config.yaml" \
   actor_rollout_ref.rollout.agent.num_workers=4 \
-  reward.custom_reward_function.path=/home/zhenqinli/rl-workplace/verl/code-agent/code_agent/rewards/code_agent_reward.py \
+  reward.custom_reward_function.path="${PROJECT_ROOT}/verl/code-agent/code_agent/rewards/code_agent_reward.py" \
   reward.custom_reward_function.name=compute_score \
   trainer.default_local_dir="$OUT" \
   trainer.project_name=swegym-code-agent-grpo \

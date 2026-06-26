@@ -688,7 +688,7 @@ Base commit: {row["base_commit"]}
     }
 
 
-def build_weak_grpo_prompt(row: Dict[str, Any]) -> Dict[str, Any]:
+def build_grpo_prompt(row: Dict[str, Any]) -> Dict[str, Any]:
     gold_files = extract_modified_files_from_patch(row.get("patch", ""))
 
     user = f"""You are a software engineering agent.
@@ -730,7 +730,7 @@ Base commit: {row["base_commit"]}
             "gold_patch": row.get("patch", ""),
             "gold_files": gold_files,
             "forbidden_modify_tests": True,
-            "weak_reward_items": [
+            "reward_items": [
                 "valid_action_format",
                 "search_or_open_hits_gold_file",
                 "patch_can_apply",
@@ -738,7 +738,6 @@ Base commit: {row["base_commit"]}
                 "changed_python_files_compile",
                 "patch_similarity_to_gold",
             ],
-            "note": "Weak GRPO data. This does not require official Docker environment.",
         },
     }
 
@@ -835,7 +834,7 @@ def main() -> None:
         "valid_rows": len(rows),
         "repos": len(repos),
         "splits": split_names,
-        "note": "All valid SWE-Gym rows are used for SFT and weak GRPO data.",
+        "note": "All valid SWE-Gym rows are used for SFT and GRPO data.",
     })
 
     print("[Repos]", len(repos))
@@ -853,7 +852,7 @@ def main() -> None:
     stage1_path = out_dir / "stage1_rag_patch_sft.jsonl"
     stage2_path = out_dir / "stage2_agent_trajectory_sft.jsonl"
     mixed_path = out_dir / "stage1_stage2_mixed_sft.jsonl"
-    grpo_path = out_dir / "weak_grpo_prompts.jsonl"
+    grpo_path = out_dir / "grpo_prompts.jsonl"
     fail_path = out_dir / "failures.jsonl"
 
     for p in [retrieval_path, stage1_path, stage2_path, mixed_path, grpo_path, fail_path]:
@@ -868,7 +867,7 @@ def main() -> None:
         "stage1_sft": 0,
         "stage2_sft": 0,
         "mixed_sft": 0,
-        "weak_grpo": 0,
+        "grpo": 0,
     }
 
     for row in tqdm(rows, desc="build RAG/SFT/GRPO"):
@@ -915,7 +914,7 @@ def main() -> None:
 
             ex1 = build_stage1(row, context_text)
             ex2 = build_stage2(row, gold_files, args.include_sandbox_action)
-            ex3 = build_weak_grpo_prompt(row)
+            ex3 = build_grpo_prompt(row)
 
             append_jsonl(stage1_path, ex1)
             append_jsonl(stage2_path, ex2)
@@ -927,7 +926,7 @@ def main() -> None:
             stats["stage1_sft"] += 1
             stats["stage2_sft"] += 1
             stats["mixed_sft"] += 2
-            stats["weak_grpo"] += 1
+            stats["grpo"] += 1
 
             if hit:
                 stats["hit_gold_file"] += 1

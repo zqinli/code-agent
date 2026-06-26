@@ -378,11 +378,9 @@ def _load_ground_truth(ground_truth: Any, extra_info: dict[str, Any] | None) -> 
         gt = {}
     reward_meta = _json_loads_maybe(extra_info.get("reward_meta"), {})
     if isinstance(reward_meta, dict):
-        for key in ["gold_patch", "gold_files", "weak_reward_items", "reward_items", "forbidden_modify_tests"]:
+        for key in ["gold_patch", "gold_files", "reward_items", "forbidden_modify_tests"]:
             if key in reward_meta and key not in gt:
                 gt[key] = reward_meta[key]
-    if "reward_items" not in gt and "weak_reward_items" in gt:
-        gt["reward_items"] = gt["weak_reward_items"]
     reference_patch = gt.get("reference_patch") or gt.get("gold_patch")
     if reference_patch:
         tests = gt.setdefault("tests", {})
@@ -419,7 +417,7 @@ def compute_score(
     execution = gt.get("execution") or {}
     tests = gt.get("tests") or {}
     reward_spec = gt.get("reward_spec") or {}
-    reward_items = gt.get("reward_items") or gt.get("weak_reward_items") or []
+    reward_items = gt.get("reward_items") or []
     execution_type = execution.get("type")
     timeout = int(execution.get("timeout_sec") or os.environ.get("CODE_AGENT_REWARD_TIMEOUT", DEFAULT_TIMEOUT))
 
