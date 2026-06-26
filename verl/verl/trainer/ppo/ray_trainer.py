@@ -1189,27 +1189,33 @@ class RayPPOTrainer:
         batch_td = left_right_2_no_padding(batch_td)
         # step 3: add meta info
         calculate_sum_pi_squared = self.config.actor_rollout_ref.actor.get("calculate_sum_pi_squared", False)
+        calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
+            self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+        )
         tu.assign_non_tensor(
             batch_td,
-            calculate_entropy=True,
+            calculate_entropy=calculate_entropy,
             calculate_sum_pi_squared=calculate_sum_pi_squared,
             compute_loss=False,
         )
         output = self.actor_rollout_wg.compute_log_prob(batch_td)
         # gather output
-        entropy = tu.get(output, "entropy")
+        entropy = tu.get(output, "entropy") if calculate_entropy else None
         log_probs = tu.get(output, "log_probs")
         routed_experts = tu.get(output, "routed_experts")
         sum_pi_squared = tu.get(output, "sum_pi_squared") if calculate_sum_pi_squared else None
 
         old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
         # step 4. No padding to padding
-        entropy = no_padding_2_padding(entropy, batch_td)
+        if entropy is not None:
+            entropy = no_padding_2_padding(entropy, batch_td)
         log_probs = no_padding_2_padding(log_probs, batch_td)
         if sum_pi_squared is not None:
             sum_pi_squared = no_padding_2_padding(sum_pi_squared, batch_td)
         # step 5: rebuild a tensordict and convert to dataproto
-        result = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
+        result = {"old_log_probs": log_probs.float()}
+        if entropy is not None:
+            result["entropys"] = entropy.float()
         if routed_experts is not None:
             result["routed_experts"] = routed_experts
         if sum_pi_squared is not None:
@@ -1465,21 +1471,23 @@ class RayPPOTrainer:
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            actor_config = self.config.actor_rollout_ref.actor
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys,
-                                loss_mask=response_masks,
-                                loss_agg_mode=actor_config.loss_agg_mode,
-                                loss_scale_factor=actor_config.loss_scale_factor,
-                            )
                             old_log_prob_metrics = {
-                                "actor/entropy": entropy_agg.detach().item(),
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
+                            if "entropys" in old_log_prob.batch:
+                                entropys = old_log_prob.batch["entropys"]
+                                response_masks = batch.batch["response_mask"]
+                                actor_config = self.config.actor_rollout_ref.actor
+                                entropy_agg = agg_loss(
+                                    loss_mat=entropys,
+                                    loss_mask=response_masks,
+                                    loss_agg_mode=actor_config.loss_agg_mode,
+                                    loss_scale_factor=actor_config.loss_scale_factor,
+                                )
+                                old_log_prob_metrics["actor/entropy"] = entropy_agg.detach().item()
                             metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
+                            if "entropys" in old_log_prob.batch:
+                                old_log_prob.batch.pop("entropys")
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
                                     "Detected conflicting router replay configuration: "
@@ -1565,9 +1573,9 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup > self.global_steps:
-                        # Still in critic warmup, only update weights to wake up rollout replicas.
+                        # Still in critic warmup, only wake up rollout replicas.
                         if not self.use_hf_agent_rollout:
-                            self.checkpoint_manager.update_weights(self.global_steps)
+                            self.checkpoint_manager.wake_up_rollout()
                     else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
@@ -1598,7 +1606,20 @@ class RayPPOTrainer:
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
                             if not self.use_hf_agent_rollout:
-                                self.checkpoint_manager.update_weights(self.global_steps)
+                                rollout_update_weights_freq = int(
+                                    self.config.trainer.get("rollout_update_weights_freq", 1) or 1
+                                )
+                                should_update_rollout_weights = (
+                                    rollout_update_weights_freq <= 1
+                                    or self.global_steps % rollout_update_weights_freq == 0
+                                    or is_last_step
+                                )
+                                if should_update_rollout_weights:
+                                    self.checkpoint_manager.update_weights(self.global_steps)
+                                else:
+                                    self.checkpoint_manager.wake_up_rollout()
+                                metrics["rollout/update_weights_freq"] = rollout_update_weights_freq
+                                metrics["rollout/update_weights_applied"] = float(should_update_rollout_weights)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

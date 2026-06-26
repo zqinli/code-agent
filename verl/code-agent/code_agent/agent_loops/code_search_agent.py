@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,15 @@ from verl.workers.rollout.replica import TokenOutput
 from code_agent.protocols.actions import ParsedAction, parse_action, parse_final_action
 from code_agent.tools.retrieval import run_search
 from code_agent.tools.sandbox import run_code
+
+
+ACTION_STOP_STRINGS = (
+    "</search_code>",
+    "</open_file>",
+    "</run_sandbox>",
+    "</generate_patch>",
+    "</final>",
+)
 
 
 def _to_positive_int(value: Any) -> int | None:
@@ -43,6 +53,33 @@ def _normalize_messages(raw_prompt: Any) -> list[dict[str, Any]]:
     raise RuntimeError(f"Expected raw_prompt/prompt as a list of chat messages, got {type(raw_prompt)}")
 
 
+def _sanitize_protocol_prompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            sanitized.append(message)
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            content = content.replace("- <direct_answer>answer</direct_answer>\n", "")
+            content = content.replace("<direct_answer>", "<final>")
+            content = content.replace("</direct_answer>", "</final>")
+        sanitized.append({**message, "content": content})
+    return sanitized
+
+
+def _normalize_extra_info(extra_info: Any) -> dict[str, Any]:
+    if extra_info is None:
+        return {}
+    if isinstance(extra_info, dict):
+        return dict(extra_info)
+    if hasattr(extra_info, "tolist"):
+        extra_info = extra_info.tolist()
+        if isinstance(extra_info, dict):
+            return dict(extra_info)
+    return {}
+
+
 @register("code_search_agent")
 class CodeSearchAgentLoop(AgentLoopBase):
     """Code/Search AgentLoop for autonomous code-generation RL."""
@@ -51,10 +88,14 @@ class CodeSearchAgentLoop(AgentLoopBase):
         super().__init__(*args, **kwargs)
         self.max_turns = int(os.environ.get("CODE_AGENT_MAX_TURNS", "2"))
         self.max_obs_length = int(os.environ.get("CODE_AGENT_MAX_OBS_LENGTH", "1024"))
+        self.action_max_new_tokens = int(os.environ.get("CODE_AGENT_ACTION_MAX_NEW_TOKENS", "256"))
+        self.final_max_new_tokens = int(os.environ.get("CODE_AGENT_FINAL_MAX_NEW_TOKENS", "768"))
         self.enable_final_rollout = os.environ.get("CODE_AGENT_ENABLE_FINAL_ROLLOUT", "1") == "1"
         self.response_length = int(
             getattr(self.rollout_config, "response_length", os.environ.get("CODE_AGENT_MAX_RESPONSE_LENGTH", "2048"))
         )
+        self.sample_repo_root: Path | None = None
+        self.sample_repo: str = ""
 
     def _encode(self, text: str) -> list[int]:
         if not text:
@@ -154,10 +195,10 @@ class CodeSearchAgentLoop(AgentLoopBase):
         return len(kept) == len(new_ids)
 
     async def _run_code(self, code: str) -> str:
-        return await asyncio.to_thread(run_code, code)
+        return await asyncio.to_thread(run_code, code, cwd=self.sample_repo_root)
 
     async def _run_search(self, query: str) -> str:
-        return await asyncio.to_thread(run_search, query)
+        return await asyncio.to_thread(run_search, query, source_dataset=self.sample_repo or None)
 
     def _workspace_root(self) -> Path | None:
         for key in ["CODE_AGENT_WORKSPACE_PATH", "CODE_AGENT_REPO_ROOT", "CODE_AGENT_REPO_DIR"]:
@@ -165,6 +206,68 @@ class CodeSearchAgentLoop(AgentLoopBase):
             if value:
                 return Path(value).expanduser().resolve()
         return None
+
+    def _repo_root_from_extra_info(self, extra_info: dict[str, Any], raw_prompt: list[dict[str, Any]]) -> Path | None:
+        root = self._workspace_root()
+        if root is None:
+            return None
+
+        repo = str(extra_info.get("repo") or "").strip()
+        if not repo:
+            prompt_text = "\n".join(
+                str(message.get("content") or "") for message in raw_prompt if isinstance(message, dict)
+            )
+            match = re.search(
+                r"^Repository:\s*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\s*$",
+                prompt_text,
+                flags=re.MULTILINE,
+            )
+            if match:
+                repo = match.group(1).strip()
+
+        self.sample_repo = repo
+        candidates: list[Path] = []
+        if repo:
+            candidates.append(root / repo)
+            if "/" in repo:
+                candidates.append(root / repo.split("/", 1)[1])
+        candidates.append(root)
+
+        for candidate in candidates:
+            try:
+                resolved = candidate.expanduser().resolve()
+            except Exception:
+                continue
+            if resolved.is_dir():
+                return resolved
+        return root
+
+    def _candidate_file_paths(self, raw_path: Path, root: Path) -> list[Path]:
+        if raw_path.is_absolute():
+            return [raw_path]
+
+        candidates: list[Path] = []
+        repo_root = self.sample_repo_root
+        if repo_root is not None:
+            candidates.append(repo_root / raw_path)
+
+        candidates.append(root / raw_path)
+
+        if repo_root is not None and self.sample_repo:
+            repo_name = self.sample_repo.split("/", 1)[-1]
+            parts = raw_path.parts
+            if len(parts) > 1 and parts[0] == repo_name:
+                candidates.append(repo_root / Path(*parts[1:]))
+
+        deduped: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(candidate)
+        return deduped
 
     def _open_file_sync(self, file_path: str) -> str:
         root = self._workspace_root()
@@ -176,16 +279,29 @@ class CodeSearchAgentLoop(AgentLoopBase):
         raw_path = Path(str(file_path).strip())
         if not str(raw_path):
             return "open_file unavailable: empty path"
-        target = raw_path if raw_path.is_absolute() else root / raw_path
-        try:
-            target = target.resolve()
-        except Exception as exc:
-            return f"open_file unavailable: cannot resolve path: {exc}"
 
-        try:
-            target.relative_to(root)
-        except ValueError:
-            return "open_file unavailable: path is outside configured workspace"
+        target = None
+        resolve_errors: list[str] = []
+        for candidate in self._candidate_file_paths(raw_path, root):
+            try:
+                resolved = candidate.resolve()
+            except Exception as exc:
+                resolve_errors.append(str(exc))
+                continue
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                continue
+            if resolved.exists():
+                target = resolved
+                break
+
+        if target is None:
+            detail = f" resolve_errors={resolve_errors[:2]}" if resolve_errors else ""
+            repo_hint = f" repo_root={self.sample_repo_root}" if self.sample_repo_root else ""
+            return f"open_file unavailable: file does not exist: {raw_path}.{repo_hint}{detail}"
+        if target.name.startswith("._"):
+            return f"open_file unavailable: ignoring metadata sidecar file: {raw_path}"
         if not target.exists():
             return f"open_file unavailable: file does not exist: {raw_path}"
         if not target.is_file():
@@ -205,7 +321,24 @@ class CodeSearchAgentLoop(AgentLoopBase):
     async def _open_file(self, file_path: str) -> str:
         return await asyncio.to_thread(self._open_file_sync, file_path)
 
-    async def _generate_once(self, prompt_ids: list[int], sampling_params: dict[str, Any]) -> list[int]:
+    async def _generate_once(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        max_new_tokens: int | None = None,
+    ) -> list[int]:
+        sampling_params = dict(sampling_params)
+        if max_new_tokens is not None:
+            sampling_params["max_new_tokens"] = max(1, int(max_new_tokens))
+        if os.environ.get("CODE_AGENT_USE_ACTION_STOPS", "1") == "1":
+            existing_stop = sampling_params.get("stop")
+            if existing_stop is None:
+                sampling_params["stop"] = list(ACTION_STOP_STRINGS)
+            elif isinstance(existing_stop, str):
+                sampling_params["stop"] = [existing_stop, *ACTION_STOP_STRINGS]
+            else:
+                sampling_params["stop"] = list(existing_stop) + list(ACTION_STOP_STRINGS)
+            sampling_params.setdefault("include_stop_str_in_output", True)
         output = await self.server_manager.generate(
             request_id=uuid4().hex,
             prompt_ids=prompt_ids,
@@ -262,6 +395,9 @@ class CodeSearchAgentLoop(AgentLoopBase):
         if raw_prompt is None:
             raise RuntimeError("CodeSearchAgentLoop requires raw_prompt or prompt. Set data.return_raw_chat=True.")
         raw_prompt = _normalize_messages(raw_prompt)
+        raw_prompt = _sanitize_protocol_prompt(raw_prompt)
+        extra_info = _normalize_extra_info(kwargs.get("extra_info"))
+        self.sample_repo_root = self._repo_root_from_extra_info(extra_info, raw_prompt)
 
         multi_modal_data = await self.process_vision_info(raw_prompt)
         prompt_ids = await self.apply_chat_template(raw_prompt)
@@ -284,8 +420,10 @@ class CodeSearchAgentLoop(AgentLoopBase):
                 break
 
             num_turns += 1
+            remain = max_response_length - len(response_ids)
+            generate_tokens = min(remain, max(1, self.action_max_new_tokens))
             t0 = time.time()
-            gen_ids = await self._generate_once(cur_prompt_ids, sampling_params)
+            gen_ids = await self._generate_once(cur_prompt_ids, sampling_params, max_new_tokens=generate_tokens)
             t_generate += time.time() - t0
 
             action = parse_action(self._decode(gen_ids))
@@ -321,8 +459,10 @@ class CodeSearchAgentLoop(AgentLoopBase):
 
         if self.enable_final_rollout and not finished and can_final_rollout and len(response_ids) < max_response_length:
             num_turns += 1
+            remain = max_response_length - len(response_ids)
+            generate_tokens = min(remain, max(1, self.final_max_new_tokens))
             t0 = time.time()
-            gen_ids = await self._generate_once(cur_prompt_ids, sampling_params)
+            gen_ids = await self._generate_once(cur_prompt_ids, sampling_params, max_new_tokens=generate_tokens)
             t_generate += time.time() - t0
 
             final_action = parse_final_action(self._decode(gen_ids))

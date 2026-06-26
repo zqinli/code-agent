@@ -348,10 +348,22 @@ def _reward_weights(parts: dict[str, float], reward_spec: Any, reward_items: Any
 def _weighted_sum(parts: dict[str, float], weights: dict[str, Any]) -> float:
     if not weights:
         return sum(parts.values()) / max(1, len(parts))
+    normalized_weights: dict[str, float] = {}
+    for key, value in weights.items():
+        try:
+            weight = float(value or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if weight > 0:
+            normalized_weights[str(key)] = weight
+    weight_sum = sum(normalized_weights.values())
+    if weight_sum > 0:
+        normalized_weights = {key: value / weight_sum for key, value in normalized_weights.items()}
+
     total = 0.0
     used_weight = 0.0
     for key, value in parts.items():
-        weight = float(weights.get(key, 0.0) or 0.0)
+        weight = normalized_weights.get(key, 0.0)
         total += weight * max(0.0, min(1.0, value))
         used_weight += weight
     if used_weight < 1.0:

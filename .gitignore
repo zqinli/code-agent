@@ -14,6 +14,7 @@ tmp_worktrees/
 *.pth
 *.bin
 *.safetensors
+*.whl
 
 # python
 __pycache__/
@@ -26,3 +27,4 @@ logs/
 
 # system
 .DS_Store
+._*

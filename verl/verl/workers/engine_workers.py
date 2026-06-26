@@ -672,10 +672,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         actor model in-place and does not synchronize weights to a rollout
         server.
         """
-        assert "actor" in self.role, "hf_generate only supports actor role"
+        return self.hf_generate_batch([prompt_ids], sampling_params=sampling_params)[0]
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @torch.no_grad()
+    def hf_generate_batch(self, prompt_ids_batch: list[list[int]], sampling_params: dict | None = None):
+        """Generate a micro-batch directly from the actor HF policy."""
+        assert "actor" in self.role, "hf_generate_batch only supports actor role"
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from transformers import GenerationConfig
 
         sampling_params = dict(sampling_params or {})
         module = self.actor.engine.module
@@ -686,25 +690,35 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         module.eval()
         device = next(module.parameters()).device
-        input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-        attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
-        position_ids = attention_mask.cumsum(dim=-1) - 1
+        if not prompt_ids_batch:
+            return []
 
         response_length = int(sampling_params.get("max_new_tokens") or sampling_params.get("max_tokens") or 512)
+        eos_token_id = sampling_params.get("eos_token_id")
+        pad_token_id = sampling_params.get("pad_token_id")
+        if pad_token_id is None:
+            pad_token_id = eos_token_id if eos_token_id is not None else 0
+
+        batch_size = len(prompt_ids_batch)
+        prompt_length = max(len(prompt_ids) for prompt_ids in prompt_ids_batch)
+        input_ids = torch.full((batch_size, prompt_length), int(pad_token_id), dtype=torch.long, device=device)
+        attention_mask = torch.zeros((batch_size, prompt_length), dtype=torch.long, device=device)
+        for row, prompt_ids in enumerate(prompt_ids_batch):
+            ids = torch.tensor([int(token_id) for token_id in prompt_ids], dtype=torch.long, device=device)
+            input_ids[row, -len(prompt_ids) :] = ids
+            attention_mask[row, -len(prompt_ids) :] = 1
+        position_ids = attention_mask.cumsum(dim=-1) - 1
+        position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+
         top_k = sampling_params.get("top_k", self.config.rollout.get("top_k", 0))
         top_k = max(0, int(top_k)) if top_k is not None else 0
         temperature = float(sampling_params.get("temperature", self.config.rollout.temperature))
         do_sample = bool(sampling_params.get("do_sample", self.config.rollout.get("do_sample", True)))
-
-        generation_config = GenerationConfig(
-            do_sample=do_sample,
-            num_beams=1,
-            top_p=float(sampling_params.get("top_p", self.config.rollout.get("top_p", 1.0))),
-            top_k=top_k,
-            temperature=temperature,
-        )
-        eos_token_id = sampling_params.get("eos_token_id")
-        pad_token_id = sampling_params.get("pad_token_id")
+        if temperature <= 0:
+            do_sample = False
+            temperature = 1.0
+        if not do_sample:
+            temperature = 1.0
 
         param_ctx = nullcontext()
         if isinstance(module, FSDP):
@@ -716,21 +730,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 max_new_tokens=response_length,
+                do_sample=do_sample,
+                num_beams=1,
+                top_p=float(sampling_params.get("top_p", self.config.rollout.get("top_p", 1.0))),
+                top_k=top_k,
+                temperature=temperature,
                 eos_token_id=eos_token_id,
                 pad_token_id=pad_token_id,
-                generation_config=generation_config,
                 output_scores=False,
                 return_dict_in_generate=True,
                 use_cache=True,
             )
 
-        token_ids = output.sequences[0, input_ids.size(1) :].detach().cpu().tolist()
+        sequences = output.sequences[:, input_ids.size(1) :].detach().cpu().tolist()
         if was_training:
             module.train()
         if model_was_offloaded:
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        aggressive_empty_cache(force_sync=True)
-        return {"token_ids": [int(token_id) for token_id in token_ids], "stop_reason": "completed"}
+        if os.environ.get("HF_AGENT_EMPTY_CACHE_AFTER_GENERATE", "0") == "1":
+            aggressive_empty_cache(force_sync=True)
+        return [
+            {"token_ids": [int(token_id) for token_id in token_ids], "stop_reason": "completed"}
+            for token_ids in sequences
+        ]
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
@@ -796,6 +818,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
+        set_expandable_segments(True)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def wake_up_rollout(self):
+        """Wake rollout memory without syncing actor weights.
+
+        This is used when rollout weight sync is intentionally skipped for a
+        few steps. In colocated hybrid mode the rollout server wake_up API is
+        not supported; the in-worker rollout adapter must resume memory.
+        """
+        assert "actor" in self.role, "wake_up_rollout only supports actor role"
+        if self.config.rollout.checkpoint_engine.backend != "naive":
+            return
+
+        set_expandable_segments(False)
+        if self.actor.engine.is_param_offload_enabled:
+            self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+            aggressive_empty_cache(force_sync=True)
+
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.resume(tags=["weights"])
+            await self.rollout.resume(tags=["kv_cache"])
+        log_gpu_memory_usage("After wake_up_rollout", logger=logger)
         set_expandable_segments(True)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)

@@ -9,7 +9,12 @@ import tempfile
 from pathlib import Path
 
 
-def _workspace_cwd(tmpdir: str) -> str:
+def _workspace_cwd(tmpdir: str, cwd: str | Path | None = None) -> str:
+    if cwd is not None:
+        path = Path(cwd).expanduser()
+        if path.is_dir():
+            return str(path.resolve())
+
     for key in ["CODE_AGENT_WORKSPACE_PATH", "CODE_AGENT_REPO_ROOT", "CODE_AGENT_REPO_DIR"]:
         value = os.environ.get(key)
         if value and Path(value).expanduser().is_dir():
@@ -17,7 +22,7 @@ def _workspace_cwd(tmpdir: str) -> str:
     return tmpdir
 
 
-def run_code(command: str, timeout_sec: int | None = None) -> str:
+def run_code(command: str, timeout_sec: int | None = None, cwd: str | Path | None = None) -> str:
     """Execute a lightweight sandbox command and return a compact observation."""
     timeout = timeout_sec or int(os.environ.get("CODE_AGENT_TOOL_TIMEOUT", "10"))
     command = "" if command is None else str(command).strip()
@@ -32,7 +37,7 @@ def run_code(command: str, timeout_sec: int | None = None) -> str:
         return "ERROR: empty command"
 
     with tempfile.TemporaryDirectory(prefix="code_agent_") as tmpdir:
-        cwd = _workspace_cwd(tmpdir)
+        cwd = _workspace_cwd(tmpdir, cwd=cwd)
 
         try:
             proc = subprocess.run(

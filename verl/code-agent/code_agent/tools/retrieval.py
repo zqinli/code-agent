@@ -44,19 +44,26 @@ def _token_set(text: str) -> set[str]:
     return set(tokenize(text))
 
 
+def _is_metadata_sidecar(path: str) -> bool:
+    return any(part.startswith("._") for part in Path(path).parts)
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    if not path.exists():
+    try:
+        if not path.exists():
+            return rows
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
         return rows
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
     return rows
 
 
@@ -109,13 +116,57 @@ class HybridRAGRetriever:
         rows = _read_jsonl(self.index_dir / "docstore.jsonl")
         if not rows:
             rows = _read_jsonl(self.corpus_path)
-        return [_normalize_doc(row, idx) for idx, row in enumerate(rows) if str(row.get("text") or "").strip()]
+        docs: list[RetrievalDoc] = []
+        max_docs = int(os.environ.get("CODE_AGENT_RAG_MAX_CONTEXT_DOCS", "20000"))
+        for idx, row in enumerate(rows):
+            text = str(row.get("text") or "").strip()
+            if text:
+                docs.append(_normalize_doc(row, len(docs)))
+                continue
+
+            contexts = row.get("contexts")
+            if not isinstance(contexts, list):
+                continue
+            for context in contexts:
+                if not isinstance(context, dict):
+                    continue
+                context_text = str(context.get("text") or "").strip()
+                if not context_text:
+                    continue
+                path = str(context.get("path") or "")
+                if _is_metadata_sidecar(path):
+                    continue
+                start_line = context.get("start_line")
+                end_line = context.get("end_line")
+                location = path
+                if start_line is not None and end_line is not None:
+                    location = f"{path}:{start_line}-{end_line}"
+                docs.append(
+                    RetrievalDoc(
+                        pk=len(docs),
+                        doc_id=f"{row.get('instance_id', idx)}:{len(docs)}",
+                        text=f"{location}\n{context_text}" if location else context_text,
+                        doc_type="context",
+                        source_dataset=str(row.get("repo") or ""),
+                        source_id=str(row.get("instance_id") or ""),
+                        metadata={
+                            "repo": row.get("repo"),
+                            "base_commit": row.get("base_commit"),
+                            "path": path,
+                            "start_line": start_line,
+                            "end_line": end_line,
+                        },
+                    )
+                )
+                if len(docs) >= max_docs:
+                    return docs
+        return docs
 
     def _load_bm25(self) -> None:
         bm25_path = self.index_dir / "bm25.pkl"
-        if not bm25_path.exists():
-            return
         try:
+            if not bm25_path.exists():
+                return
             with bm25_path.open("rb") as f:
                 payload = pickle.load(f)
             self.bm25 = payload["bm25"] if isinstance(payload, dict) else payload
@@ -213,10 +264,25 @@ class HybridRAGRetriever:
                 continue
         return hits
 
-    def hybrid_search(self, query: str, top_k: int) -> list[dict[str, Any]]:
-        candidate_k = max(top_k * 4, 20)
+    def _filter_hits_by_source(
+        self,
+        hits: list[tuple[int, float]],
+        source_dataset: str | None,
+    ) -> list[tuple[int, float]]:
+        if not source_dataset:
+            return hits
+        return [
+            (pk, score)
+            for pk, score in hits
+            if (self.docs_by_pk.get(pk) is not None and self.docs_by_pk[pk].source_dataset == source_dataset)
+        ]
+
+    def hybrid_search(self, query: str, top_k: int, source_dataset: str | None = None) -> list[dict[str, Any]]:
+        candidate_k = max(top_k * (20 if source_dataset else 4), 200 if source_dataset else 20)
         sparse = self.search_bm25(query, candidate_k)
         dense = self.search_dense(query, candidate_k)
+        sparse = self._filter_hits_by_source(sparse, source_dataset)
+        dense = self._filter_hits_by_source(dense, source_dataset)
 
         fused: dict[int, dict[str, float]] = {}
         for rank, (pk, score) in enumerate(sparse, 1):
@@ -257,16 +323,17 @@ def _retriever() -> HybridRAGRetriever:
     return HybridRAGRetriever()
 
 
-def run_search(query: str, top_k: int | None = None) -> str:
+def run_search(query: str, top_k: int | None = None, source_dataset: str | None = None) -> str:
     """Return top RAG snippets for a search query."""
     query = "" if query is None else str(query).strip()
     if not query:
         return "No query provided."
 
     k = top_k or int(os.environ.get("CODE_AGENT_SEARCH_TOP_K", "3"))
-    docs = _retriever().hybrid_search(query, k)
+    docs = _retriever().hybrid_search(query, k, source_dataset=source_dataset)
     if not docs:
-        return "No relevant RAG document found."
+        suffix = f" for repo {source_dataset}" if source_dataset else ""
+        return f"No relevant RAG document found{suffix}."
 
     max_chars = int(os.environ.get("CODE_AGENT_SEARCH_DOC_CHARS", "1200"))
     snippets: list[str] = []

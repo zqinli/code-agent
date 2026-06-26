@@ -417,6 +417,14 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.wake_up() for r in self.replicas])
 
     @auto_await
+    async def wake_up_rollout(self):
+        """Wake rollout after generation without syncing weights."""
+        if self.backend == "naive":
+            ray.get(self.trainer.wake_up_rollout())
+            return
+        await self.wake_up_replicas()
+
+    @auto_await
     async def update_weights(self, global_steps: int = None):
         """Update weights from trainer to rollout replicas.
 
