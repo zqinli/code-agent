@@ -1,36 +1,42 @@
-# Code-Agent 训练工作区
+# Code-Agent: 检索增强的代码修改智能体训练框架
 
-本仓库是一个基于修改版 `verl` 的代码智能体训练工作区，面向多轮代码定位、工具调用、Patch 生成，以及 Qwen2.5-Coder 的 LoRA SFT 冷启动和 GRPO 训练。整体思路参考 Search-R1 的检索增强推理范式和 Code-R1 的代码任务强化学习训练流程。
+本项目面向复杂代码理解、代码定位与自动 Patch 生成任务，构建了一套基于 Qwen2.5-Coder 的代码智能体训练与评估框架。系统围绕多轮工具调用、代码检索、沙箱反馈、SFT 冷启动、GRPO 强化学习和 LLM-as-a-Judge 评估展开，整体思路参考 Search-R1 的检索增强推理范式与 Code-R1 的代码任务强化学习流程。
 
-## 功能概览
+## 核心亮点
 
-- 构建多轮代码修改轨迹，支持代码检索、文件读取、沙箱执行、Patch 生成和最终回答等工具调用协议。
-- 构建面向代码任务的 RAG 检索模块，支持 BM25、BGE-M3 和 Milvus，用于召回相关函数、类定义和跨文件上下文；当前训练默认使用轻量级 BM25 后端。
-- 参考 Search-R1 / Code-R1 的训练范式，基于 `verl` 对 Qwen2.5-Coder 进行 LoRA SFT 冷启动和 GRPO 训练，优化代码定位、工具调用和 Patch 生成能力。
-- 提供 vLLM 离线推理和 FastAPI 服务工具，支持批量生成、在线请求和结果追踪。
-- 提供 LLM-as-a-Judge 评估流程，从需求匹配、正确性、可执行性和代码质量等维度评估生成结果。
+- 设计多轮代码修改智能体流程，将问题解析、上下文检索、文件定位、命令执行、Patch 生成和反馈修正组织为统一的工具调用轨迹。
+- 构建面向代码仓库的混合 RAG 检索模块，融合 BM25、BGE-M3 和 Milvus，用于召回相关函数、类定义、调用关系和跨文件依赖上下文。
+- 基于 `verl` 训练 Qwen2.5-Coder，完成 LoRA SFT 冷启动和 GRPO 训练，使模型学习代码定位、工具使用和结构化 Patch 生成。
+- 集成 vLLM 离线推理与 FastAPI 服务接口，支持批量测试、在线调用和生成结果追踪。
+- 搭建 LLM-as-a-Judge 自动评估流程，从需求匹配、Patch 正确性、可执行性和代码质量等维度衡量生成结果。
 
-## 数据流程
+## 系统流程
 
-数据流程面向 SWE-Gym 风格的代码修改任务，会对 issue 实例进行规范化处理，在 `base_commit` 上检出目标仓库，检索相关代码上下文，并构造 SFT 与 GRPO 训练样本。
-
-相关处理脚本位于 `dataset/scripts/` 和 `scripts/` 目录。
-
-## 训练流程
-
-主要 SFT 脚本：
-
-```bash
-bash scripts/run_verl_sft_qwen25coder3b_2gpu.sh
+```text
+Issue / Task
+    |
+    v
+Repository Checkout + Context Preprocessing
+    |
+    v
+Hybrid Code Retrieval
+    |
+    v
+Multi-turn Tool-use Trajectory
+    |
+    v
+SFT Cold Start -> GRPO Training
+    |
+    v
+vLLM / FastAPI Inference
+    |
+    v
+LLM-as-a-Judge Evaluation
 ```
 
-主要 GRPO 脚本：
+## 工具调用协议
 
-```bash
-bash scripts/run_verl_grpo_qwen25coder3b_lora_code_agent.sh
-```
-
-当前 GRPO 路径使用 `code_search_agent` 交互循环，支持如下动作：
+智能体通过结构化 action 与代码环境交互，覆盖代码搜索、文件读取、沙箱执行、Patch 生成和最终回答等环节。
 
 ```xml
 <search_code>query</search_code>
@@ -40,11 +46,54 @@ bash scripts/run_verl_grpo_qwen25coder3b_lora_code_agent.sh
 <final>status</final>
 ```
 
-## 评估
+## 主要模块
 
-离线评估提供 vLLM 推理和 LLM-as-a-Judge 打分工具：
+```text
+dataset/scripts/                 数据预处理与轨迹构造
+scripts/                         SFT / GRPO 训练入口脚本
+verl/code-agent/code_agent/       代码智能体核心逻辑
+verl/code-agent/code_agent/tools/ 工具调用与检索组件
+verl/code-agent/code_agent/judge/ LLM-as-a-Judge 评估模块
+verl/code-agent/scripts/          推理与评估脚本
+```
+
+## 训练入口
+
+SFT 冷启动：
 
 ```bash
-verl/code-agent/scripts/infer_testset_vllm.sh
-verl/code-agent/scripts/judge_inference_outputs.sh
+bash scripts/run_verl_sft_qwen25coder3b_2gpu.sh
 ```
+
+GRPO 训练：
+
+```bash
+bash scripts/run_verl_grpo_qwen25coder3b_lora_code_agent.sh
+```
+
+## 推理与评估
+
+离线推理：
+
+```bash
+bash verl/code-agent/scripts/infer_testset_vllm.sh
+```
+
+自动评估：
+
+```bash
+bash verl/code-agent/scripts/judge_inference_outputs.sh
+```
+
+## 技术栈
+
+- Backbone: Qwen2.5-Coder
+- Training: `verl`, LoRA SFT, GRPO
+- Retrieval: BM25, BGE-M3, Milvus
+- Inference: vLLM, FastAPI
+- Evaluation: LLM-as-a-Judge
+
+## 参考
+
+- Search-R1: Retrieval-augmented reasoning for language models
+- Code-R1: Reinforcement learning for code reasoning and generation
