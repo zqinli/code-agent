@@ -25,6 +25,10 @@ __pycache__/
 *.log
 logs/
 
+# local secrets
+*.env
+!*.env.example
+
 # system
 .DS_Store
 ._*
